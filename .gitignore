@@ -32,6 +32,12 @@ yarn-error.*
 
 # local env files
 .env*.local
+/archive/cloud-functions/.env
+/archive/cloud-functions/.env.financetracker-3cd32
+/archive/cloud-functions/.secret.local
+.tools/
+firebase-debug.log
+firestore-debug.log
 
 # typescript
 *.tsbuildinfo

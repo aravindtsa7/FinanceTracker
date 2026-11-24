@@ -1,0 +1,90 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function owner(uid) { return signedIn() && request.auth.uid == uid; }
+    function validDevice(id) { return id is string && id.matches('^TSA-[A-F0-9]{4}-[A-F0-9]{4}$'); }
+    function validContact(d) {
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 100
+        && d.phone is string && d.phone.matches('^[+]?[0-9 ()-]{7,24}$');
+    }
+    function validPending(p, bound) {
+      return p == null || (p is map && p.keys().hasOnly(['newDeviceId', 'requestedAt'])
+        && p.keys().hasAll(['newDeviceId', 'requestedAt'])
+        && validDevice(p.newDeviceId) && p.newDeviceId != bound && p.requestedAt == request.time);
+    }
+    function consumesApproval(before, after) {
+      return before.get('approveTransfer', false) == true
+        && before.pendingDeviceTransfer is map
+        && validDevice(before.pendingDeviceTransfer.newDeviceId)
+        && after.boundDeviceId == before.pendingDeviceTransfer.newDeviceId
+        && after.pendingDeviceTransfer == null && after.approveTransfer == false;
+    }
+    match /users/{uid} {
+      allow get: if owner(uid);
+      allow list, delete: if false;
+      allow create: if owner(uid)
+        && request.resource.data.keys().hasOnly(['uid', 'name', 'email', 'phone', 'boundDeviceId',
+          'licenseStatus', 'trialStartsAt', 'trialEndsAt', 'subscriptionExpiresAt',
+          'pendingDeviceTransfer', 'approveTransfer', 'lastSeenAt', 'createdAt'])
+        && request.resource.data.keys().hasAll(['uid', 'name', 'email', 'phone', 'boundDeviceId',
+          'licenseStatus', 'trialStartsAt', 'trialEndsAt', 'subscriptionExpiresAt',
+          'pendingDeviceTransfer', 'approveTransfer', 'lastSeenAt', 'createdAt'])
+        && request.resource.data.uid == uid && request.resource.data.email == request.auth.token.email
+        && validContact(request.resource.data) && validDevice(request.resource.data.boundDeviceId)
+        && request.resource.data.licenseStatus == 'trial' && request.resource.data.subscriptionExpiresAt == null
+        && request.resource.data.pendingDeviceTransfer == null && request.resource.data.approveTransfer == false
+        && request.resource.data.lastSeenAt == request.time && request.resource.data.createdAt == request.time
+        // getAfter validates the ledger and user in the same atomic transaction.
+        && request.resource.data.trialStartsAt == getAfter(/databases/$(database)/documents/licenses/$(request.resource.data.boundDeviceId)).data.trialStartsAt
+        && request.resource.data.trialEndsAt == getAfter(/databases/$(database)/documents/licenses/$(request.resource.data.boundDeviceId)).data.trialEndsAt;
+
+      allow update: if owner(uid) && validContact(request.resource.data)
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'licenseStatus', 'trialStartsAt', 'trialEndsAt', 'subscriptionExpiresAt'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'lastSeenAt', 'pendingDeviceTransfer', 'name', 'phone', 'boundDeviceId', 'approveTransfer'])
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['lastSeenAt'])
+          || request.resource.data.lastSeenAt == request.time)
+        && (consumesApproval(resource.data, request.resource.data)
+          || (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['boundDeviceId', 'approveTransfer'])
+            && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['pendingDeviceTransfer'])
+              || (resource.data.get('approveTransfer', false) == false
+                && validPending(request.resource.data.pendingDeviceTransfer, resource.data.boundDeviceId)))));
+    }
+
+    // Exact-document lookups allow a different email on the same phone to reuse
+    // the trial. This immutable ledger deliberately contains no contact details.
+    match /licenses/{deviceId} {
+      allow get: if signedIn() && validDevice(deviceId)
+        && (!exists(/databases/$(database)/documents/licenses/$(deviceId))
+          || resource.data.keys().hasOnly(['deviceId', 'trialStartsAt', 'trialEndsAt', 'createdAt'])
+          || resource.data.get('uid', '') == request.auth.uid);
+      allow list, update, delete: if false;
+      allow create: if signedIn() && validDevice(deviceId)
+        && request.resource.data.keys().hasOnly(['deviceId', 'trialStartsAt', 'trialEndsAt', 'createdAt'])
+        && request.resource.data.keys().hasAll(['deviceId', 'trialStartsAt', 'trialEndsAt', 'createdAt'])
+        && request.resource.data.deviceId == deviceId && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.boundDeviceId == deviceId
+        && request.resource.data.trialStartsAt == getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.trialStartsAt
+        && request.resource.data.trialEndsAt == getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.trialEndsAt
+        && ((request.resource.data.trialStartsAt is timestamp
+            && request.resource.data.trialEndsAt == request.resource.data.trialStartsAt + duration.value(7, 'd')
+            && request.resource.data.trialStartsAt <= request.time)
+          // Existing admin-created ISO-string records can be copied on transfer;
+          // new accounts cannot introduce arbitrary string trial dates.
+          || (exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            && request.resource.data.trialStartsAt == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.trialStartsAt
+            && request.resource.data.trialEndsAt == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.trialEndsAt));
+    }
+    match /sessionChecks/{uid} {
+      allow get: if owner(uid);
+      allow create, update: if owner(uid)
+        && request.resource.data.keys().hasOnly(['checkedAt'])
+        && request.resource.data.keys().hasAll(['checkedAt'])
+        && request.resource.data.checkedAt == request.time;
+      allow list, delete: if false;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
